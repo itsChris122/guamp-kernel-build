@@ -82,9 +82,9 @@ jobs:
 
       - name: Check out the GPU submodules
         run: |
-          # Only the three the user-space build reads; the kernel submodules are not needed here.
-          git submodule update --init --depth 1 drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4
-          git submodule status drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4
+          # Only the four the user-space build reads (ArmSmmu4K: the host Turnip check); the kernel submodules are not needed here.
+          git submodule update --init --depth 1 drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4 kits/ArmSmmu4K
+          git submodule status drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4 kits/ArmSmmu4K
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -193,7 +193,7 @@ jobs:
             echo "unixnu=$(git rev-parse HEAD)"
             echo "device=$(git -C device rev-parse HEAD)"
             echo "mesa=$(git -C .cache/mesa-work rev-parse HEAD)"
-            git submodule status drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4
+            git submodule status drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4 kits/ArmSmmu4K
             xcodebuild -version | sed -n 1p
           } > "$out/provenance.txt"
           (cd "$out" && find . -type f -print0 | sort -z | xargs -0 shasum -a 256) > "$RUNNER_TEMP/guamp-gpu.sha256"
