@@ -208,6 +208,12 @@ jobs:
             fi
           done
 
+      - name: Build the Metal bridge for the host (priming cache control)
+        run: |
+          # check-priming-cache-host.py (inside the plugin build's replay check) links build/adreno-metal-bridge/host/, which
+          # build-adreno-metal-plugin.py does not build (it builds the iOS bridge after the check).
+          python3 scripts/build-adreno-metal-bridge.py --target host
+
       - name: Build the Metal plugin and adrenoprobed
         run: python3 scripts/build-adreno-metal-plugin.py
 
