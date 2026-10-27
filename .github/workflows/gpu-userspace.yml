@@ -1,0 +1,246 @@
+name: guamp GPU user space (Turnip + AdrenoMetal for the A610, encrypted outputs)
+
+# Builds the owner user-space half of the guamp GPU stack on macOS: Mesa Turnip with the Darwin KMD backend (arm64-apple-ios17),
+# the NativeAdrenoMetal plugin bundle (metal2vulkan bridge, Rust) and the adrenoprobed daemon, from upstream UniXNU at a pinned
+# commit whose AdrenoMetal carries the A610 fixes of the tb128fu port (system-memory passes, no concurrent binning) and whose
+# Adreno740 (5c8c145) is the KMD ABI the guamp kernel's NativeAdreno (xVanTuring/Adreno610 81a0b01) merged.
+# No Apple file enters or leaves this job: the iPhone-resources addon and the original trust modules stay on the
+# owner's PC, where analisi/gpu-ci/componi-gpu-addon.py merges this job's output into the payload files. The output is encrypted
+# with ARTIFACT_KEY like the kernel workflow's, so the same key file decrypts both.
+
+on:
+  workflow_dispatch:
+    inputs:
+      unixnu_repository:
+        description: UniXNU repository for the user-space build scripts and GPU components
+        required: true
+        default: UniXNU/UniXNU
+      unixnu_ref:
+        description: UniXNU commit (AdrenoMetal with the A610 fixes, Adreno740 = the kernel's KMD ABI)
+        required: true
+        default: 120067ccc43ebb5e76ec62c9219a48c897052838
+      device_repository:
+        description: Device repository as owner/name (only its GPU data file is read)
+        required: true
+        default: itsChris122/UniXNU-guamp
+      device_ref:
+        description: Device repository ref
+        required: true
+        default: codex/ram-nc-posted-20261027
+      xcode:
+        description: Xcode version of the macos-26 image (/Applications/Xcode_<version>.app)
+        required: true
+        default: "26.6"
+      host_replay:
+        description: Build the host Turnip and record the plugin's replay header (needed by build-adreno-metal-plugin.py)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-userspace-${{ inputs.unixnu_ref }}-${{ inputs.device_ref }}
+  cancel-in-progress: false
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  HOMEBREW_NO_ENV_HINTS: 1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  gpu:
+    runs-on: macos-26
+    timeout-minutes: 240
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_${{ inputs.xcode }}.app/Contents/Developer
+    steps:
+      - name: Check out UniXNU
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.unixnu_repository }}
+          ref: ${{ inputs.unixnu_ref }}
+          persist-credentials: false
+
+      - name: Check out the workflow helpers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci
+          persist-credentials: false
+
+      - name: Check out the device repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.device_repository }}
+          ref: ${{ inputs.device_ref }}
+          path: device
+          token: ${{ secrets.UNIXNU_DEVICE_TOKEN || github.token }}
+
+      - name: Check out the GPU submodules
+        run: |
+          # Only the three the user-space build reads; the kernel submodules are not needed here.
+          git submodule update --init --depth 1 drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4
+          git submodule status drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install host tools
+        run: |
+          # glslang: Mesa's Vulkan runtime; shaderc (glslc) and spirv-tools (spirv-val): the plugin's smoke shaders;
+          # llvm: llvm-as for the metal2vulkan fixtures. ninja and cmake come with the image.
+          brew install llvm glslang shaderc spirv-tools
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          rustup toolchain install 1.98.0 --profile minimal --target aarch64-apple-ios
+          [ -d "$DEVELOPER_DIR" ] || { echo "::error::Xcode not found at $DEVELOPER_DIR"; exit 1; }
+          xcodebuild -version | sed -n 1p
+          xcrun --sdk iphoneos --show-sdk-version
+          for tool in glslangValidator glslc spirv-val llvm-as ninja cargo; do printf '%-18s %s\n' "$tool" "$(command -v $tool || echo MISSING)"; done
+
+      - name: Cache keys
+        id: keys
+        run: |
+          pins=scripts/data/adreno-compiler-inputs.json
+          {
+            echo "mesa=$(jq -r .mesa.commit $pins)-$(cat $pins $(jq -r '.patches[]' $pins) | shasum -a 256 | cut -c1-16)"
+            echo "bison=$(jq -r .bison.sha256 $pins | cut -c1-16)"
+            echo "venv=$(shasum -a 256 scripts/requirements-adreno-compiler.txt | cut -c1-16)"
+            echo "m2v=$(cat scripts/data/gpu-metal-vulkan-inputs.json drivers/AdrenoMetal/bridge/patches/* | shasum -a 256 | cut -c1-16)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore the patched Mesa source
+        id: mesa
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/mesa-work
+          key: mesa-work-${{ steps.keys.outputs.mesa }}
+
+      - name: Restore bison
+        id: bison
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/mesa-tools
+          key: mesa-tools-${{ runner.arch }}-${{ steps.keys.outputs.bison }}
+
+      - name: Restore the Mesa Python environment
+        id: venv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/mesa-venv
+          key: mesa-venv-${{ runner.arch }}-py313-${{ steps.keys.outputs.venv }}
+
+      # Meson/ninja build directories: an exact hit rebuilds nothing; a restore-key hit rebuilds what changed (ccache cannot
+      # be slotted in: build-turnip-darwin.py writes absolute xcrun compiler paths into the cross file).
+      - name: Restore the Turnip build directories
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            build/mesa-tu
+            build/mesa-tu-ios
+            build/mesa-tu-ios.cross
+          key: mesa-build-${{ inputs.xcode }}-${{ steps.keys.outputs.mesa }}-${{ hashFiles('scripts/build-turnip-darwin.py', 'drivers/Adreno740/**/*.h') }}
+          restore-keys: |
+            mesa-build-${{ inputs.xcode }}-${{ steps.keys.outputs.mesa }}-
+            mesa-build-${{ inputs.xcode }}-
+
+      - name: Restore cargo and the bridge target directory
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/m2v-target
+          key: m2v-${{ inputs.xcode }}-${{ steps.keys.outputs.m2v }}-${{ hashFiles('drivers/AdrenoMetal/bridge/*.rs') }}
+          restore-keys: |
+            m2v-${{ inputs.xcode }}-${{ steps.keys.outputs.m2v }}-
+            m2v-${{ inputs.xcode }}-
+
+      - name: Prepare the pinned inputs
+        env:
+          NEED_MESA: ${{ steps.mesa.outputs.cache-hit != 'true' }}
+          NEED_BISON: ${{ steps.bison.outputs.cache-hit != 'true' }}
+          NEED_VENV: ${{ steps.venv.outputs.cache-hit != 'true' }}
+        run: bash ci/.github/scripts/prepare-gpu-inputs.sh
+
+      - name: Build the host Turnip (replay recording)
+        if: inputs.host_replay
+        run: python3 scripts/build-turnip-darwin.py --target host
+
+      - name: Build Turnip for iOS
+        run: python3 scripts/build-turnip-darwin.py --target ios
+
+      - name: Build the Metal plugin and adrenoprobed
+        run: python3 scripts/build-adreno-metal-plugin.py
+
+      - name: Stage the guamp output
+        run: |
+          out="$RUNNER_TEMP/guamp-gpu"
+          rm -rf "$out"; mkdir -p "$out"
+          cp -R build/adreno-metal-plugin "$out/plugin"
+          # sheng has no Bluetooth and starts adrenoprobed under bluetoothd's label; guamp keeps its own bluetoothd.
+          rm -f "$out/plugin/com.apple.bluetoothd.plist"
+          rm -rf "$out/plugin/NativeAdrenoMetal.dSYM"
+          python3 ci/.github/scripts/owner-trust-module.py "$out/plugin/trust.json" "$out/owner-trust-module.bin"
+          cp device/scripts/data/guamp-a610-gpu.json "$out/" 2>/dev/null || true
+          cp build/mesa-tu-ios/builtin-build-profile.json "$out/" 2>/dev/null || true
+          mkdir -p "$out/logs"; cp .cache/mesa-tu-*.log build/adreno-metal-bridge/build-*.log "$out/logs/" 2>/dev/null || true
+          {
+            echo "unixnu=$(git rev-parse HEAD)"
+            echo "device=$(git -C device rev-parse HEAD)"
+            echo "mesa=$(git -C .cache/mesa-work rev-parse HEAD)"
+            git submodule status drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4
+            xcodebuild -version | sed -n 1p
+          } > "$out/provenance.txt"
+          (cd "$out" && find . -type f -print0 | sort -z | xargs -0 shasum -a 256) > "$RUNNER_TEMP/guamp-gpu.sha256"
+          mv "$RUNNER_TEMP/guamp-gpu.sha256" "$out/SHA256SUMS"
+          cat "$out/plugin/trust.json"
+
+      - name: Encrypt the output
+        id: seal
+        env:
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+        run: |
+          tar -c -C "$RUNNER_TEMP" guamp-gpu | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:ARTIFACT_KEY -out "$RUNNER_TEMP/gpu.tar.enc"
+          ls -l "$RUNNER_TEMP/gpu.tar.enc"
+
+      - name: Upload the encrypted output
+        if: steps.seal.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unixnu-guamp-gpu-enc
+          path: ${{ runner.temp }}/gpu.tar.enc
+          retention-days: 7
+
+      - name: Encrypt the build logs on failure
+        if: failure()
+        env:
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/gpu-logs"
+          cp .cache/*.log build/adreno-metal-bridge/*.log "$RUNNER_TEMP/gpu-logs/" 2>/dev/null || true
+          tar -c -C "$RUNNER_TEMP" gpu-logs | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:ARTIFACT_KEY -out "$RUNNER_TEMP/gpu-logs.tar.enc"
+
+      - name: Upload the encrypted logs on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unixnu-guamp-gpu-logs-enc
+          path: ${{ runner.temp }}/gpu-logs.tar.enc
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## guamp GPU user space"
+            echo
+            echo "UniXNU \`${{ inputs.unixnu_ref }}\`, device \`${{ inputs.device_ref }}\`, Xcode ${{ inputs.xcode }}"
+            echo
+            echo "Artifact \`unixnu-guamp-gpu-enc\` (7 days): plugin bundle, adrenoprobed, launchd plists, trust.json, owner trust module."
+            echo "Merge locally with analisi/gpu-ci/componi-gpu-addon.py (iPhone-resources addon and original trust stay on the PC)."
+          } >> "$GITHUB_STEP_SUMMARY"
