@@ -94,7 +94,7 @@ jobs:
         run: |
           # glslang: Mesa's Vulkan runtime; shaderc (glslc) and spirv-tools (spirv-val): the plugin's smoke shaders;
           # llvm: llvm-as for the metal2vulkan fixtures. ninja and cmake come with the image.
-          brew install llvm glslang shaderc spirv-tools
+          brew install llvm glslang shaderc spirv-tools vulkan-headers vulkan-loader
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
           rustup toolchain install 1.98.0 --profile minimal --target aarch64-apple-ios
           [ -d "$DEVELOPER_DIR" ] || { echo "::error::Xcode not found at $DEVELOPER_DIR"; exit 1; }
