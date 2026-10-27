@@ -32,7 +32,7 @@ on:
         required: true
         default: "26.6"
       skip_host_pressure:
-        description: Skip the host-simulator "deferred BO pressure" case of check-turnip-darwin-host.py (runner copy only)
+        description: Skip the host-simulator "deferred BO pressure" case and missing host cache controls of check-turnip-darwin-host.py (runner copy only)
         type: boolean
         default: true
       host_replay:
@@ -199,6 +199,14 @@ jobs:
           grep -q "'map-cleanup-error', 'pressure'\]" "$f"
           sed -i '' "s/'map-cleanup-error', 'pressure'\]/'map-cleanup-error']/" "$f"
           grep -n "for mode in" "$f"
+          # The same host check calls two cache controls that this UniXNU commit does not contain (upstream inconsistency):
+          # missing ones are replaced, on the runner only, by a stand-in that reports the skip. Host-only controls, no plugin code.
+          for check in check-quartzcore-turnip-cache-host.py check-priming-cache-host.py check-turnip-pipeline-cache-host.py; do
+            if [ ! -f "scripts/$check" ]; then
+              printf '#!/usr/bin/env python3\nprint("SKIP: %s is not in this UniXNU commit (guamp CI stand-in, host-only control)")\n' "$check" > "scripts/$check"
+              echo "stand-in: scripts/$check"
+            fi
+          done
 
       - name: Build the Metal plugin and adrenoprobed
         run: python3 scripts/build-adreno-metal-plugin.py
