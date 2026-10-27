@@ -174,6 +174,16 @@ jobs:
       - name: Build Turnip for iOS
         run: python3 scripts/build-turnip-darwin.py --target ios
 
+      - name: Host simulator stub for proc_selfpid
+        run: |
+          # Adreno740 5c8c145's user client calls proc_selfpid (BO import bookkeeping); its host simulator (tests/hostsim, used only
+          # to record the plugin's replay header on the Mac) does not define it yet. The stub lives in the simulator only.
+          shim=drivers/Adreno740/tests/hostsim/host_iokit_shim.cpp
+          if ! grep -q 'proc_selfpid' "$shim"; then
+            printf '\n// guamp CI: kernel BSD call of NativeAdrenoUserClient::importBo, answered for the host simulator\nextern "C" int proc_selfpid(void) { return 1; }\n' >> "$shim"
+          fi
+          tail -3 "$shim"
+
       - name: Build the Metal plugin and adrenoprobed
         run: python3 scripts/build-adreno-metal-plugin.py
 
