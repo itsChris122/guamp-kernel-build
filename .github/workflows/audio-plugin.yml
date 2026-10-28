@@ -1,0 +1,131 @@
+name: guamp audio plug-in (GuampAudio.driver for audiomxd, encrypted outputs)
+
+# Builds the owner AudioServerPlugIn of the guamp iOS audio plan (device repository package/GuampAudio) for arm64-apple-ios17
+# with the iPhoneOS SDK of the macOS runner, signs it ad hoc with 4 KiB code pages (the guamp kernel runs 4K pages, like the
+# Adreno Metal plugin of gpu-userspace.yml) and writes its CDHash for the owner trust cache. Before the build the PC checks of
+# the package run here too (host test of the IO clock/FIFO, syntax check). No Apple file enters or leaves this job: the
+# iPhone-resources/GPU addon and the original trust modules stay on the owner's PC, where the device repository's
+# scripts/compose-guamp-audio-addon.py merges this output into the payload files (addon entry audio/HAL/GuampAudio.driver/*,
+# CDHash in the owner trust module). The output is encrypted with ARTIFACT_KEY like the other workflows'.
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_repository:
+        description: Device repository as owner/name (only package/GuampAudio is read)
+        required: true
+        default: itsChris122/UniXNU-guamp
+      device_ref:
+        description: Device repository ref
+        required: true
+        default: codex/audio-ios-20261028
+      xcode:
+        description: Xcode version of the macos-26 image (/Applications/Xcode_<version>.app)
+        required: true
+        default: "26.6"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audio-plugin-${{ inputs.device_ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  audio:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_${{ inputs.xcode }}.app/Contents/Developer
+    steps:
+      - name: Check out the device repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.device_repository }}
+          ref: ${{ inputs.device_ref }}
+          path: device
+          token: ${{ secrets.UNIXNU_DEVICE_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          [ -d "$DEVELOPER_DIR" ] || { echo "::error::Xcode not found at $DEVELOPER_DIR"; exit 1; }
+          xcodebuild -version | sed -n 1p
+          xcrun --sdk iphoneos --show-sdk-version
+          test -f device/package/GuampAudio/build-guamp-audio-plugin.sh
+
+      - name: Plug-in source checks (iOS SDK headers)
+        run: |
+          # The real SDK headers this time (the PC check uses stand-ins): syntax of the plug-in and of the shared kernel ABI header.
+          sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+          cd device/package/GuampAudio
+          xcrun --sdk iphoneos clang -target arm64-apple-ios17.0 -isysroot "$sdk" -std=gnu17 -Wall -Wextra -Werror \
+            -Wno-four-char-constants -Wno-multichar -fsyntax-only GuampAudio.c
+          printf '#include "guamp_audio_dev.h"\nint k(void) { return (int)sizeof(struct guamp_audio_info); }\n' > "$RUNNER_TEMP/abi.c"
+          xcrun --sdk iphoneos clang -target arm64-apple-ios17.0 -isysroot "$sdk" -std=gnu17 -Wall -Wextra -Werror -I . \
+            -fsyntax-only "$RUNNER_TEMP/abi.c"
+
+      - name: Host test of the IO clock and FIFO
+        run: |
+          # GuampAudioCore.h and the ABI asserts of guamp_audio_dev.h, natively on the Mac (Apple clang, ASan/UBSan).
+          cd device/package/GuampAudio/tests
+          xcrun clang -std=gnu17 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all \
+            guamp_audio_core_test.c -o "$RUNNER_TEMP/core-test"
+          "$RUNNER_TEMP/core-test"
+
+      - name: Build and sign GuampAudio.driver
+        run: |
+          out="$RUNNER_TEMP/guamp-audio"
+          rm -rf "$out"; mkdir -p "$out"
+          bash device/package/GuampAudio/build-guamp-audio-plugin.sh "$out"
+          codesign --display --verbose=4 "$out/GuampAudio.driver" 2>&1 | grep -E '^(Identifier|Format|CodeDirectory|Hash type|CDHash|Page size|Signature)'
+          cat "$out/trust.json"
+
+      - name: Stage the output
+        run: |
+          out="$RUNNER_TEMP/guamp-audio"
+          cp device/package/GuampAudio/guamp_audio_dev.h "$out/"
+          {
+            echo "device=$(git -C device rev-parse HEAD)"
+            echo "repository=${{ inputs.device_repository }}"
+            xcodebuild -version | sed -n 1p
+            echo "sdk=$(xcrun --sdk iphoneos --show-sdk-version)"
+          } > "$out/provenance.txt"
+          (cd "$out" && find . -type f -print0 | sort -z | xargs -0 shasum -a 256) > "$RUNNER_TEMP/guamp-audio.sha256"
+          mv "$RUNNER_TEMP/guamp-audio.sha256" "$out/SHA256SUMS"
+
+      - name: Encrypt the output
+        id: seal
+        env:
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+        run: |
+          tar -c -C "$RUNNER_TEMP" guamp-audio | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:ARTIFACT_KEY -out "$RUNNER_TEMP/audio.tar.enc"
+          ls -l "$RUNNER_TEMP/audio.tar.enc"
+
+      - name: Upload the encrypted output
+        if: steps.seal.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unixnu-guamp-audio-enc
+          path: ${{ runner.temp }}/audio.tar.enc
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## guamp audio plug-in"
+            echo
+            echo "Device \`${{ inputs.device_repository }}\` at \`${{ inputs.device_ref }}\`, Xcode ${{ inputs.xcode }}"
+            echo
+            if [ -f "$RUNNER_TEMP/guamp-audio/trust.json" ]; then
+              echo "CDHash (owner trust cache): \`$(sed -n 's/.*"cdhash": "\([0-9a-f]*\)".*/\1/p' "$RUNNER_TEMP/guamp-audio/trust.json")\`"
+              echo
+            fi
+            echo "Artifact \`unixnu-guamp-audio-enc\` (7 days): GuampAudio.driver, trust.json, guamp_audio_dev.h."
+            echo "Merge locally with scripts/compose-guamp-audio-addon.py of the device repository (addon + owner trust bundle)."
+          } >> "$GITHUB_STEP_SUMMARY"
