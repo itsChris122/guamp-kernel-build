@@ -109,6 +109,9 @@ jobs:
           assert n == 1, 'bridge patch list not found'
           p.write_text(new); print('bridge patches:', len(names), names[-1])
           PY
+            # The fork's priming cache records differ from what UniXNU main's host control expects ("Exactly one bounded native
+            # priming record"); that control runs on the Mac simulator only, so the runner's copy is replaced by a stand-in.
+            echo 'print("SKIP: check-priming-cache-host.py with the AdrenoMetal fork (guamp CI stand-in, host-only control)")' > scripts/check-priming-cache-host.py
           fi
           [ -e drivers/NativeMobileDisplay ] || ln -s GopFramebuffer drivers/NativeMobileDisplay
           ls -l drivers/NativeMobileDisplay && test -f drivers/NativeMobileDisplay/NativeGOPWire.h
