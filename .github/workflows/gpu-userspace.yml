@@ -19,6 +19,10 @@ on:
         description: UniXNU commit (AdrenoMetal with the A610 fixes, Adreno740 = the kernel's KMD ABI)
         required: true
         default: 120067ccc43ebb5e76ec62c9219a48c897052838
+      adreno_metal_ref:
+        description: Optional AdrenoMetal commit from xVanTuring/AdrenoMetal (e.g. the tb128fu fork 2ff4be9 with the A610 fixes); empty keeps the UniXNU submodule
+        required: false
+        default: ""
       device_repository:
         description: Device repository as owner/name (only its GPU data file is read)
         required: true
@@ -85,11 +89,17 @@ jobs:
           token: ${{ secrets.UNIXNU_DEVICE_TOKEN || github.token }}
 
       - name: Check out the GPU submodules
+        env:
+          ADRENO_METAL_REF: ${{ inputs.adreno_metal_ref }}
         run: |
           # Only the four the user-space build reads (ArmSmmu4K: the host Turnip check); the kernel submodules are not needed here.
           git submodule update --init --depth 1 drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4 kits/ArmSmmu4K drivers/GopFramebuffer
           # AdrenoMetal ce5e19e includes ../NativeMobileDisplay/NativeGOPWire.h, the component's former name; this UniXNU commit
           # names the checkout drivers/GopFramebuffer, so the runner links the old name to it.
+          if [ -n "$ADRENO_METAL_REF" ]; then
+            git -C drivers/AdrenoMetal fetch --depth 1 https://github.com/xVanTuring/AdrenoMetal.git "$ADRENO_METAL_REF"
+            git -C drivers/AdrenoMetal checkout --detach FETCH_HEAD
+          fi
           [ -e drivers/NativeMobileDisplay ] || ln -s GopFramebuffer drivers/NativeMobileDisplay
           ls -l drivers/NativeMobileDisplay && test -f drivers/NativeMobileDisplay/NativeGOPWire.h
           git submodule status drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4 kits/ArmSmmu4K
