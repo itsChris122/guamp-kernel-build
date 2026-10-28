@@ -87,7 +87,11 @@ jobs:
       - name: Check out the GPU submodules
         run: |
           # Only the four the user-space build reads (ArmSmmu4K: the host Turnip check); the kernel submodules are not needed here.
-          git submodule update --init --depth 1 drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4 kits/ArmSmmu4K
+          git submodule update --init --depth 1 drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4 kits/ArmSmmu4K drivers/GopFramebuffer
+          # AdrenoMetal ce5e19e includes ../NativeMobileDisplay/NativeGOPWire.h, the component's former name; this UniXNU commit
+          # names the checkout drivers/GopFramebuffer, so the runner links the old name to it.
+          [ -e drivers/NativeMobileDisplay ] || ln -s GopFramebuffer drivers/NativeMobileDisplay
+          ls -l drivers/NativeMobileDisplay && test -f drivers/NativeMobileDisplay/NativeGOPWire.h
           git submodule status drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4 kits/ArmSmmu4K
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
