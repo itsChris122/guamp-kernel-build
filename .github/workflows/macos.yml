@@ -255,10 +255,16 @@ jobs:
           [ -n "$mj" ] || exec "$real" "${args[@]}"
           probe="$mj.probe.$$"
           rm -f "$probe"
+          t0=$(date +%s)
           if "$real" "${args[@]}" -MJ "$probe" -fdriver-only >/dev/null 2>&1 && record=$(<"$probe") && [[ "$record" == *', "-fdriver-only"'* ]]; then
             rm -f "$probe"
             printf '%s\n' "${record/, \"-fdriver-only\"/}" >> "$mj"
-            exec ccache "$real" "${args[@]}"
+            t1=$(date +%s)
+            ccache "$real" "${args[@]}"
+            status=$?
+            # Seconds spent in the record probe and in ccache (whole seconds; their sums over the build are what counts).
+            echo "$(( t1 - t0 )) $(( $(date +%s) - t1 ))" >> "${0%/*}/times"
+            exit "$status"
           fi
           rm -f "$probe"
           exec "$real" "${args[@]}" -MJ "$mj"
@@ -272,6 +278,8 @@ jobs:
             {
               echo "export CCACHE_DIR='$RUNNER_TEMP/ccache'"
               echo "export CCACHE_MAXSIZE=4G"
+              # Depend mode: a miss compiles once and reads the -MD output instead of running the preprocessor too.
+              echo "export CCACHE_DEPEND=true"
               echo "export MAKEFLAGS=' -- CC=$wrap/clang CXX=$wrap/clang++'"
             } > "$wrap/env"
           else
@@ -347,6 +355,7 @@ jobs:
           if [ -f "$RUNNER_TEMP/ccache-wrap/env" ]; then . "$RUNNER_TEMP/ccache-wrap/env"; fi
           # Progress every 30 s (counts only, nothing from the logs): where the time goes.
           (
+            set +e +o pipefail
             start=$(date +%s); tree="out/$BOARD/tree"
             while sleep 30; do
               objects=$(find "$tree/build/xnu/ios-obj" -name '*.o' 2>/dev/null | wc -l | tr -d ' ')
@@ -357,8 +366,13 @@ jobs:
           monitor=$!
           status=0
           ./unixnu build kernel || status=$?
+          pkill -P "$monitor" sleep 2>/dev/null || true
           kill "$monitor" 2>/dev/null || true
-          if [ -n "${CCACHE_DIR:-}" ]; then ccache --show-stats; fi
+          if [ -n "${CCACHE_DIR:-}" ]; then
+            ccache --show-stats
+            awk '{ p += $1; c += $2; n++ } END { print "ccache wrapper: " n " compiles, record probe " p " s, ccache " c " s (summed over parallel jobs)" }' \
+              "$RUNNER_TEMP/ccache-wrap/times" 2>/dev/null || true
+          fi
           exit "$status"
 
       - name: Save the build caches (encrypted)
@@ -378,6 +392,7 @@ jobs:
             # Keep only what this build used, so a snapshot stays the size of one build.
             age=$(( $(date +%s) - $(cat "$RUNNER_TEMP/ci-cache-start") + 60 ))
             ccache --evict-older-than "${age}s" >/dev/null
+            ccache --show-stats | grep -i "cache size" || true
             tar -c -C "$CCACHE_DIR" . | enc "$cache/ccache.tar.enc"
             echo "ccache=true" >> "$GITHUB_OUTPUT"
           fi
