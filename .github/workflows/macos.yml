@@ -56,6 +56,10 @@ on:
         description: Mark Setup as done in the Data seed
         type: boolean
         default: false
+      clean_build:
+        description: Build without the compiler cache and the cached kernel SDK root (neither restored nor saved)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -151,7 +155,7 @@ jobs:
           # cmake and ninja come with the image. Homebrew LLVM is keg-only and stays off PATH: the driver finds it for
           # the archive builders, and everything else uses Xcode's clang. LLD is a separate formula since LLVM 23;
           # the payload step links the panic screen with ld.lld.
-          brew install llvm lld mtools dtc
+          brew install llvm lld mtools dtc ccache
           if ! command -v unifdef >/dev/null; then
             brew install unifdef
             echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
@@ -220,13 +224,186 @@ jobs:
           rm -f "$RUNNER_TEMP/prelink-candidate.tar.enc"
           ls out/guamp/tree/build/native-prelink | sed 's/^/candidate: /'
 
+      # Build caches (skipped with clean_build). The caches of a public repository can be read by other workflows of the
+      # repository, so both are stored only as one archive encrypted with ARTIFACT_KEY, like the prelink candidate:
+      # - the ccache directory of the XNU compiles (objects built against the Xcode SDK), and
+      # - tree/.cache/fakeroot, the kernel SDK root (XNU installhdrs, AvailabilityVersions, libplatform, libfirehose_kernel).
+      # ccache is content addressed, so it restores the newest snapshot of the same toolchain and saves a new one each run.
+      # The SDK root is reused only on an exact match of the UniXNU commit and of every device input except drivers/ and
+      # package/ (the build script skips installhdrs and libfirehose when their outputs exist).
+      - name: Prepare the build caches
+        id: cachecfg
+        if: ${{ !inputs.clean_build }}
+        env:
+          XCODE: ${{ inputs.xcode }}
+        run: |
+          wrap="$RUNNER_TEMP/ccache-wrap"
+          mkdir -p "$wrap" "$RUNNER_TEMP/ci-cache" "$RUNNER_TEMP/ccache"
+          # XNU compiles with -MJ (compile records that the archive builders read) and ccache refuses -MJ. The wrapper
+          # writes the record with a driver-only run of the same command (the same JSON, minus the extra flag) and takes
+          # the object from ccache; any other call (links, MIG, probes) runs the compiler directly.
+          for name in clang clang++; do
+            real=$(xcrun -sdk iphoneos -find "$name")
+            sed "s|@REAL@|$real|" > "$wrap/$name" <<'SH'
+          #!/bin/bash
+          real='@REAL@'
+          mj=
+          args=()
+          while [ $# -gt 0 ]; do
+            if [ "$1" = -MJ ] && [ $# -ge 2 ]; then mj=$2; shift 2; else args+=("$1"); shift; fi
+          done
+          [ -n "$mj" ] || exec "$real" "${args[@]}"
+          probe="$mj.probe.$$"
+          rm -f "$probe"
+          if "$real" "${args[@]}" -MJ "$probe" -fdriver-only >/dev/null 2>&1 && record=$(<"$probe") && [[ "$record" == *', "-fdriver-only"'* ]]; then
+            rm -f "$probe"
+            printf '%s\n' "${record/, \"-fdriver-only\"/}" >> "$mj"
+            exec ccache "$real" "${args[@]}"
+          fi
+          rm -f "$probe"
+          exec "$real" "${args[@]}" -MJ "$mj"
+          SH
+            chmod +x "$wrap/$name"
+          done
+          # Command-line make variables (MAKEFLAGS) reach every make of the build but not xcodebuild or the Python builders.
+          printf 'all:\n\t@echo $(origin CC) $(CC)\n' > "$RUNNER_TEMP/makeflags-check.mk"
+          check=$(MAKEFLAGS=" -- CC=$wrap/clang CXX=$wrap/clang++" make -s -f "$RUNNER_TEMP/makeflags-check.mk")
+          if [ "$check" = "command line $wrap/clang" ]; then
+            {
+              echo "export CCACHE_DIR='$RUNNER_TEMP/ccache'"
+              echo "export CCACHE_MAXSIZE=4G"
+              echo "export MAKEFLAGS=' -- CC=$wrap/clang CXX=$wrap/clang++'"
+            } > "$wrap/env"
+          else
+            echo "::warning::make ignores MAKEFLAGS variables ($check); building without ccache"
+          fi
+          patches=$( { find patches kits/NativePrelink/patches device/patches/xnu device/kits/NativePrelink/patches -type f 2>/dev/null || true; } \
+            | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256 | cut -c1-16)
+          device=$( { find device/patches device/kits device/scripts device/configs device/unixnu.lock device/board.toml feeds.toml -type f 2>/dev/null || true; } \
+            | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256 | cut -c1-16)
+          unixnu=$( { git rev-parse HEAD; git diff HEAD; } | shasum -a 256 | cut -c1-16)
+          prefix="xnu-ccache-v1-$ImageOS-$(uname -m)-xcode$XCODE"
+          {
+            echo "ccache_key=$prefix-$DEFCONFIG-$patches-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            echo "ccache_restore<<EOF"
+            echo "$prefix-$DEFCONFIG-$patches-"
+            echo "$prefix-$DEFCONFIG-"
+            echo "$prefix-"
+            echo "EOF"
+            echo "fakeroot_key=xnu-fakeroot-v1-$ImageOS-$ImageVersion-$(uname -m)-xcode$XCODE-$DEFCONFIG-$unixnu-$device"
+          } >> "$GITHUB_OUTPUT"
+          date +%s > "$RUNNER_TEMP/ci-cache-start"
+
+      - name: Restore the compiler cache (encrypted)
+        id: ccache_restore
+        if: ${{ !inputs.clean_build }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ci-cache/ccache.tar.enc
+          key: ${{ steps.cachecfg.outputs.ccache_key }}
+          restore-keys: ${{ steps.cachecfg.outputs.ccache_restore }}
+
+      - name: Restore the kernel SDK root (encrypted)
+        id: fakeroot_restore
+        if: ${{ !inputs.clean_build }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ci-cache/fakeroot.tar.enc
+          key: ${{ steps.cachecfg.outputs.fakeroot_key }}
+
+      - name: Unpack the build caches
+        if: ${{ !inputs.clean_build }}
+        env:
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+          BOARD: ${{ steps.check.outputs.board }}
+        run: |
+          dec() { openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:ARTIFACT_KEY -in "$1"; }
+          cache="$RUNNER_TEMP/ci-cache"
+          if [ -f "$cache/ccache.tar.enc" ]; then
+            dec "$cache/ccache.tar.enc" | tar -x -C "$RUNNER_TEMP/ccache" || { echo "::warning::compiler cache unreadable, starting empty"; rm -rf "$RUNNER_TEMP/ccache"; mkdir -p "$RUNNER_TEMP/ccache"; }
+            rm -f "$cache/ccache.tar.enc"
+          fi
+          fakeroot="out/$BOARD/tree/.cache/fakeroot"
+          if [ -f "$cache/fakeroot.tar.enc" ] && [ ! -e "$fakeroot" ]; then
+            mkdir -p "$fakeroot"
+            dec "$cache/fakeroot.tar.enc" | tar -x -C "$fakeroot" || { echo "::warning::SDK root cache unreadable, rebuilding it"; rm -rf "$fakeroot"; }
+          fi
+          rm -f "$cache/fakeroot.tar.enc"
+          if [ -f "$RUNNER_TEMP/ccache-wrap/env" ]; then
+            . "$RUNNER_TEMP/ccache-wrap/env"
+            ccache --zero-stats >/dev/null
+            ccache --show-stats | sed -n '/Cache size/,$p'
+          fi
+          ls "$fakeroot" 2>/dev/null | sed 's/^/SDK root from cache: /' || true
+
       - name: Build kernel
         id: kernel
         env:
           # prepare-xnu-source.py lists Apple sources through the GitHub API; anonymous calls from hosted runners hit
           # the shared rate limit (HTTP 403).
           GITHUB_TOKEN: ${{ github.token }}
-        run: ./unixnu build kernel
+          BOARD: ${{ steps.check.outputs.board }}
+        run: |
+          if [ -f "$RUNNER_TEMP/ccache-wrap/env" ]; then . "$RUNNER_TEMP/ccache-wrap/env"; fi
+          # Progress every 30 s (counts only, nothing from the logs): where the time goes.
+          (
+            start=$(date +%s); tree="out/$BOARD/tree"
+            while sleep 30; do
+              objects=$(find "$tree/build/xnu/ios-obj" -name '*.o' 2>/dev/null | wc -l | tr -d ' ')
+              headers=$(ls "$tree"/.cache/fakeroot/.xnu-*-headers 2>/dev/null | wc -l | tr -d ' ')
+              echo "[progress +$(( $(date +%s) - start ))s] xnu objects=$objects sdk-root-headers=$headers"
+            done
+          ) &
+          monitor=$!
+          status=0
+          ./unixnu build kernel || status=$?
+          kill "$monitor" 2>/dev/null || true
+          if [ -n "${CCACHE_DIR:-}" ]; then ccache --show-stats; fi
+          exit "$status"
+
+      - name: Save the build caches (encrypted)
+        id: cachepack
+        if: ${{ always() && !cancelled() && !inputs.clean_build && (steps.kernel.outcome == 'success' || steps.kernel.outcome == 'failure') }}
+        env:
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+          BOARD: ${{ steps.check.outputs.board }}
+          FAKEROOT_HIT: ${{ steps.fakeroot_restore.outputs.cache-hit }}
+          KERNEL: ${{ steps.kernel.outcome }}
+        run: |
+          enc() { openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:ARTIFACT_KEY -out "$1"; }
+          cache="$RUNNER_TEMP/ci-cache"
+          mkdir -p "$cache"
+          if [ -f "$RUNNER_TEMP/ccache-wrap/env" ]; then
+            . "$RUNNER_TEMP/ccache-wrap/env"
+            # Keep only what this build used, so a snapshot stays the size of one build.
+            age=$(( $(date +%s) - $(cat "$RUNNER_TEMP/ci-cache-start") + 60 ))
+            ccache --evict-older-than "${age}s" >/dev/null
+            tar -c -C "$CCACHE_DIR" . | enc "$cache/ccache.tar.enc"
+            echo "ccache=true" >> "$GITHUB_OUTPUT"
+          fi
+          fakeroot="out/$BOARD/tree/.cache/fakeroot"
+          if [ "$FAKEROOT_HIT" != true ] && [ "$KERNEL" = success ] && ls "$fakeroot"/.xnu-*-headers >/dev/null 2>&1 \
+              && [ -f "$fakeroot/usr/local/lib/kernel/libfirehose_kernel.a" ]; then
+            # What the cached SDK root holds (top-level folders and file counts only).
+            for entry in "$fakeroot"/*; do echo "SDK root: $(basename "$entry") $(find "$entry" -type f | wc -l | tr -d ' ') files"; done
+            tar -c -C "$fakeroot" . | enc "$cache/fakeroot.tar.enc"
+            echo "fakeroot=true" >> "$GITHUB_OUTPUT"
+          fi
+          ls -l "$cache"
+
+      - name: Save the compiler cache
+        if: ${{ always() && steps.cachepack.outputs.ccache == 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ci-cache/ccache.tar.enc
+          key: ${{ steps.cachecfg.outputs.ccache_key }}
+
+      - name: Save the kernel SDK root
+        if: ${{ always() && steps.cachepack.outputs.fakeroot == 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ci-cache/fakeroot.tar.enc
+          key: ${{ steps.cachecfg.outputs.fakeroot_key }}
 
       # Archive builders that check original kexts (the legacy display, PMGR audits) read a prelink candidate of an earlier
       # build of the same kernelcache from build/native-prelink. Keep this build's kernel and plan there, in the cached tree.
