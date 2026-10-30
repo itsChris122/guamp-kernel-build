@@ -151,7 +151,7 @@ jobs:
           # cmake and ninja come with the image. Homebrew LLVM is keg-only and stays off PATH: the driver finds it for
           # the archive builders, and everything else uses Xcode's clang. LLD is a separate formula since LLVM 23;
           # the payload step links the panic screen with ld.lld.
-          brew install llvm lld mtools dtc
+          brew install llvm lld mtools dtc ccache
           if ! command -v unifdef >/dev/null; then
             brew install unifdef
             echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
@@ -220,13 +220,30 @@ jobs:
           rm -f "$RUNNER_TEMP/prelink-candidate.tar.enc"
           ls out/guamp/tree/build/native-prelink | sed 's/^/candidate: /'
 
+      # guamp 30/10: the XNU objects of earlier runs through ccache (scripts/build-xnu-4k-baseline.sh uses it when present).
+      - name: Restore the compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/../ccache-xnu
+          key: ccache-xnu-${{ github.run_id }}
+          restore-keys: ccache-xnu-
+
       - name: Build kernel
         id: kernel
         env:
+          CCACHE_DIR: ${{ runner.temp }}/../ccache-xnu
+          CCACHE_BASEDIR: ${{ github.workspace }}
+          CCACHE_NOHASHDIR: "true"
+          CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers
+          CCACHE_MAXSIZE: 3G
+          CCACHE_COMPRESS: "true"
           # prepare-xnu-source.py lists Apple sources through the GitHub API; anonymous calls from hosted runners hit
           # the shared rate limit (HTTP 403).
           GITHUB_TOKEN: ${{ github.token }}
-        run: ./unixnu build kernel
+        run: |
+          ccache -z >/dev/null 2>&1 || true
+          ./unixnu build kernel
+          ccache -s 2>/dev/null | head -12 || true
 
       # Archive builders that check original kexts (the legacy display, PMGR audits) read a prelink candidate of an earlier
       # build of the same kernelcache from build/native-prelink. Keep this build's kernel and plan there, in the cached tree.
