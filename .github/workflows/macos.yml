@@ -151,7 +151,7 @@ jobs:
           # cmake and ninja come with the image. Homebrew LLVM is keg-only and stays off PATH: the driver finds it for
           # the archive builders, and everything else uses Xcode's clang. LLD is a separate formula since LLVM 23;
           # the payload step links the panic screen with ld.lld.
-          brew install llvm lld mtools dtc
+          brew install llvm lld mtools dtc ccache
           if ! command -v unifdef >/dev/null; then
             brew install unifdef
             echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
@@ -220,13 +220,65 @@ jobs:
           rm -f "$RUNNER_TEMP/prelink-candidate.tar.enc"
           ls out/guamp/tree/build/native-prelink | sed 's/^/candidate: /'
 
+      # guamp 30/10: XNU objects of earlier runs through ccache (scripts/build-xnu-4k-baseline.sh of the device repository
+      # passes CC/CXX through ccache when it is installed). This repository is public: the cache holds objects built from
+      # Apple sources, so it is stored encrypted with ARTIFACT_KEY like every other output.
+      - name: Restore the compiler cache (encrypted)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ci-cache/ccache.tar.enc
+          key: ccache-xnu-${{ github.run_id }}
+          restore-keys: ccache-xnu-
+
+      - name: Unpack the compiler cache
+        env:
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ccache"
+          if [ -f "$RUNNER_TEMP/ci-cache/ccache.tar.enc" ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:ARTIFACT_KEY -in "$RUNNER_TEMP/ci-cache/ccache.tar.enc"               | tar -x -C "$RUNNER_TEMP/ccache" || { echo "::warning::compiler cache unreadable, starting empty"; rm -rf "$RUNNER_TEMP/ccache"; mkdir -p "$RUNNER_TEMP/ccache"; }
+            rm -f "$RUNNER_TEMP/ci-cache/ccache.tar.enc"
+          fi
+          date +%s > "$RUNNER_TEMP/ccache-start"
+          du -sh "$RUNNER_TEMP/ccache"
+
       - name: Build kernel
         id: kernel
         env:
+          CCACHE_DIR: ${{ runner.temp }}/ccache
+          CCACHE_BASEDIR: ${{ github.workspace }}
+          CCACHE_NOHASHDIR: "true"
+          CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers
+          CCACHE_MAXSIZE: 3G
           # prepare-xnu-source.py lists Apple sources through the GitHub API; anonymous calls from hosted runners hit
           # the shared rate limit (HTTP 403).
           GITHUB_TOKEN: ${{ github.token }}
-        run: ./unixnu build kernel
+        run: |
+          ccache -z >/dev/null 2>&1 || true
+          ./unixnu build kernel
+          ccache -s 2>/dev/null | head -14 || true
+
+      - name: Pack the compiler cache
+        id: ccachepack
+        if: ${{ always() && !cancelled() && (steps.kernel.outcome == 'success' || steps.kernel.outcome == 'failure') }}
+        env:
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+          CCACHE_DIR: ${{ runner.temp }}/ccache
+        run: |
+          # only what this build used, so the snapshot stays the size of one build
+          age=$(( $(date +%s) - $(cat "$RUNNER_TEMP/ccache-start") + 60 ))
+          ccache --evict-older-than "${age}s" >/dev/null 2>&1 || true
+          mkdir -p "$RUNNER_TEMP/ci-cache"
+          tar -c -C "$CCACHE_DIR" . | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:ARTIFACT_KEY -out "$RUNNER_TEMP/ci-cache/ccache.tar.enc"
+          ls -l "$RUNNER_TEMP/ci-cache"
+          echo "ccache=true" >> "$GITHUB_OUTPUT"
+
+      - name: Save the compiler cache
+        if: ${{ always() && steps.ccachepack.outputs.ccache == 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ci-cache/ccache.tar.enc
+          key: ccache-xnu-${{ github.run_id }}
 
       # Archive builders that check original kexts (the legacy display, PMGR audits) read a prelink candidate of an earlier
       # build of the same kernelcache from build/native-prelink. Keep this build's kernel and plan there, in the cached tree.
