@@ -146,14 +146,28 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
           for tool in glslangValidator glslc spirv-val llvm-as ninja cargo; do printf '%-18s %s\n' "$tool" "$(command -v $tool || echo MISSING)"; done
 
+      # guamp's own Turnip fixes: the device repository's patches/mesa-turnip/*.patch (paths relative to the Mesa root) are appended,
+      # in name order, to the runner copy of the recorded Mesa patch list, after turnip-darwin-kmd.patch and the rest. So
+      # prepare-gpu-inputs.sh applies them, the mesa cache key covers them, and build-turnip-darwin.py's patch-identity guard
+      # (mesa_patch_identity.py: every changed file must be reconstructed by the recorded list) accepts the tree.
+      - name: Record the device Mesa/Turnip patches
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path('scripts/data/adreno-compiler-inputs.json'); pins = json.loads(p.read_text())
+          extra = [str(x) for x in sorted(pathlib.Path('device/patches/mesa-turnip').glob('*.patch'))]
+          assert not set(extra) & set(pins['patches'])
+          pins['patches'] += extra
+          p.write_text(json.dumps(pins, indent=2) + '\n')
+          print('recorded Mesa patches:', len(pins['patches']), '(device:', extra or 'none', ')')
+          PY
+
       - name: Cache keys
         id: keys
         run: |
           pins=scripts/data/adreno-compiler-inputs.json
           {
-            # The device's patches/mesa-turnip/*.patch are part of the patched Mesa source (cached in .cache/mesa-work): in the key.
-            dev=$(cat device/patches/mesa-turnip/*.patch 2>/dev/null | shasum -a 256 | cut -c1-16)
-            echo "mesa=$(jq -r .mesa.commit $pins)-$(cat $pins $(jq -r '.patches[]' $pins) | shasum -a 256 | cut -c1-16)-dev$dev"
+            echo "mesa=$(jq -r .mesa.commit $pins)-$(cat $pins $(jq -r '.patches[]' $pins) | shasum -a 256 | cut -c1-16)"
             echo "bison=$(jq -r .bison.sha256 $pins | cut -c1-16)"
             echo "venv=$(shasum -a 256 scripts/requirements-adreno-compiler.txt | cut -c1-16)"
             echo "m2v=$(cat scripts/data/gpu-metal-vulkan-inputs.json drivers/AdrenoMetal/bridge/patches/* | shasum -a 256 | cut -c1-16)"
@@ -213,25 +227,14 @@ jobs:
           NEED_VENV: ${{ steps.venv.outputs.cache-hit != 'true' }}
         run: bash ci/.github/scripts/prepare-gpu-inputs.sh
 
-      # guamp's own Turnip fixes: the device repository's patches/mesa-turnip/*.patch (paths relative to the Mesa root), applied in
-      # name order on top of the pinned list (after turnip-darwin-kmd.patch and the rest). Only on a fresh Mesa source: a cache hit
-      # (key includes these patches) already holds them, which is checked with a reverse apply.
-      - name: Apply the device Mesa/Turnip patches
-        env:
-          NEED_MESA: ${{ steps.mesa.outputs.cache-hit != 'true' }}
+      # The device Mesa/Turnip patches are now in the source (applied by prepare-gpu-inputs.sh, or from the cache): check and list.
+      - name: Check the device Mesa/Turnip patches
         run: |
           if ! compgen -G "device/patches/mesa-turnip/*.patch" > /dev/null; then echo "no device mesa-turnip patches"; exit 0; fi
-          applied=()
           for p in device/patches/mesa-turnip/*.patch; do
-            if [ "$NEED_MESA" = true ]; then
-              git -C .cache/mesa-work apply --check --verbose "$PWD/$p" || { echo "::error::Mesa device patch $(basename "$p") does not apply"; exit 1; }
-              git -C .cache/mesa-work apply "$PWD/$p"
-            else
-              git -C .cache/mesa-work apply --reverse --check "$PWD/$p" || { echo "::error::cached Mesa source lacks $(basename "$p")"; exit 1; }
-            fi
-            applied+=("$(basename "$p") $(shasum -a 256 "$p" | cut -c1-16)")
+            git -C .cache/mesa-work apply --reverse --check "$PWD/$p" || { echo "::error::Mesa device patch $(basename "$p") is not in the source"; exit 1; }
+            echo "mesa-turnip patch: $(basename "$p") $(shasum -a 256 "$p" | cut -c1-16)"
           done
-          echo "mesa-turnip patches (NEED_MESA=$NEED_MESA):"; printf '  %s\n' "${applied[@]}"
 
       - name: Build the host Turnip (replay recording)
         if: inputs.host_replay
