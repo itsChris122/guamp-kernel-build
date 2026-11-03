@@ -151,7 +151,9 @@ jobs:
         run: |
           pins=scripts/data/adreno-compiler-inputs.json
           {
-            echo "mesa=$(jq -r .mesa.commit $pins)-$(cat $pins $(jq -r '.patches[]' $pins) | shasum -a 256 | cut -c1-16)"
+            # The device's patches/mesa-turnip/*.patch are part of the patched Mesa source (cached in .cache/mesa-work): in the key.
+            dev=$(cat device/patches/mesa-turnip/*.patch 2>/dev/null | shasum -a 256 | cut -c1-16)
+            echo "mesa=$(jq -r .mesa.commit $pins)-$(cat $pins $(jq -r '.patches[]' $pins) | shasum -a 256 | cut -c1-16)-dev$dev"
             echo "bison=$(jq -r .bison.sha256 $pins | cut -c1-16)"
             echo "venv=$(shasum -a 256 scripts/requirements-adreno-compiler.txt | cut -c1-16)"
             echo "m2v=$(cat scripts/data/gpu-metal-vulkan-inputs.json drivers/AdrenoMetal/bridge/patches/* | shasum -a 256 | cut -c1-16)"
@@ -210,6 +212,26 @@ jobs:
           NEED_BISON: ${{ steps.bison.outputs.cache-hit != 'true' }}
           NEED_VENV: ${{ steps.venv.outputs.cache-hit != 'true' }}
         run: bash ci/.github/scripts/prepare-gpu-inputs.sh
+
+      # guamp's own Turnip fixes: the device repository's patches/mesa-turnip/*.patch (paths relative to the Mesa root), applied in
+      # name order on top of the pinned list (after turnip-darwin-kmd.patch and the rest). Only on a fresh Mesa source: a cache hit
+      # (key includes these patches) already holds them, which is checked with a reverse apply.
+      - name: Apply the device Mesa/Turnip patches
+        env:
+          NEED_MESA: ${{ steps.mesa.outputs.cache-hit != 'true' }}
+        run: |
+          if ! compgen -G "device/patches/mesa-turnip/*.patch" > /dev/null; then echo "no device mesa-turnip patches"; exit 0; fi
+          applied=()
+          for p in device/patches/mesa-turnip/*.patch; do
+            if [ "$NEED_MESA" = true ]; then
+              git -C .cache/mesa-work apply --check --verbose "$PWD/$p" || { echo "::error::Mesa device patch $(basename "$p") does not apply"; exit 1; }
+              git -C .cache/mesa-work apply "$PWD/$p"
+            else
+              git -C .cache/mesa-work apply --reverse --check "$PWD/$p" || { echo "::error::cached Mesa source lacks $(basename "$p")"; exit 1; }
+            fi
+            applied+=("$(basename "$p") $(shasum -a 256 "$p" | cut -c1-16)")
+          done
+          echo "mesa-turnip patches (NEED_MESA=$NEED_MESA):"; printf '  %s\n' "${applied[@]}"
 
       - name: Build the host Turnip (replay recording)
         if: inputs.host_replay
@@ -288,6 +310,7 @@ jobs:
             echo "mesa=$(git -C .cache/mesa-work rev-parse HEAD)"
             git submodule status drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4 kits/ArmSmmu4K
             if compgen -G "device/patches/adreno-metal/*.patch" > /dev/null; then shasum -a 256 device/patches/adreno-metal/*.patch; fi
+            if compgen -G "device/patches/mesa-turnip/*.patch" > /dev/null; then shasum -a 256 device/patches/mesa-turnip/*.patch; fi
             xcodebuild -version | sed -n 1p
           } > "$out/provenance.txt"
           (cd "$out" && find . -type f -print0 | sort -z | xargs -0 shasum -a 256) > "$RUNNER_TEMP/guamp-gpu.sha256"
