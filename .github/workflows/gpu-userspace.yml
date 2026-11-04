@@ -162,6 +162,18 @@ jobs:
           print('recorded Mesa patches:', len(pins['patches']), '(device:', extra or 'none', ')')
           PY
 
+      # guamp: Turnip's on-disk shader cache. The pinned build-turnip-darwin.py configures Mesa with -Dshader-cache=disabled, so
+      # MESA_SHADER_CACHE_DIR (set by the plugin for the render server and, with device patch adreno-metal 0014, for every client)
+      # did nothing: every process compiled every pipeline from NIR to IR3 at each launch (fin44 backboardd: 147 VkPipeline
+      # makings, 9.6 s, the slowest 924 ms; Maps and Photos slow to open). UniXNU main enables it (769d533) with the Mach-O build id
+      # of ir3-darwin-build-id.patch, which the pin already applies. Before the cache keys, so the Turnip build directory key
+      # (hashFiles of the script) changes with it.
+      - name: Enable Turnip's on-disk shader cache
+        run: |
+          grep -q -- "-Dshader-cache=disabled" scripts/build-turnip-darwin.py
+          sed -i '' "s/-Dshader-cache=disabled/-Dshader-cache=enabled/" scripts/build-turnip-darwin.py
+          grep -n -- "-Dshader-cache=" scripts/build-turnip-darwin.py
+
       - name: Cache keys
         id: keys
         run: |
