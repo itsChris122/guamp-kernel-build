@@ -24,8 +24,16 @@ on:
           - kernel userdata
           - kernel userdata payload
         default: kernel
+      runner:
+        description: Hosted runner image. macos-26 (arm64) is the reference; macos-26-intel (x86_64, same Xcode 26.6) is the fallback when arm64 jobs are not acquired; macos-15 (arm64) has Xcode 26.3 at most (set xcode to 26.3) and shares the arm64 pool
+        type: choice
+        options:
+          - macos-26
+          - macos-26-intel
+          - macos-15
+        default: macos-26
       xcode:
-        description: Xcode version of the macos-26 image (/Applications/Xcode_<version>.app)
+        description: Xcode version of the runner image (/Applications/Xcode_<version>.app)
         required: true
         default: "26.6"
       ipsw_url:
@@ -79,7 +87,7 @@ jobs:
   build:
     # Pinned: macos-latest moves between images (macos-15 had an Xcode whose clang rejects the warning options the
     # build passes with -Werror). macos-26 is arm64 and carries the Xcode 26 line the build is developed with.
-    runs-on: macos-26
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 360
     env:
       DEVELOPER_DIR: /Applications/Xcode_${{ inputs.xcode }}.app/Contents/Developer
