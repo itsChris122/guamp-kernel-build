@@ -168,6 +168,21 @@ jobs:
       # makings, 9.6 s, the slowest 924 ms; Maps and Photos slow to open). UniXNU main enables it (769d533) with the Mach-O build id
       # of ir3-darwin-build-id.patch, which the pin already applies. Before the cache keys, so the Turnip build directory key
       # (hashFiles of the script) changes with it.
+      # guamp: the Metal bridge's Rust (metal2vulkan runtime and translator) with whole-program optimization. fin47's render-server
+      # profile (guamp-m2v-diag=1, profile.txt): 40 % of the compositor thread's running samples inside nmb_render_draw_indexed, 30 %
+      # of them in the bridge's own code (Turnip 5 %), malloc 10 %: the runtime calls across its two crates on every draw, which the
+      # default release profile (16 codegen units, no LTO) does not inline. lto = "fat" and codegen-units = 1 for the bridge build only.
+      - name: Optimize the Metal bridge build (LTO, one codegen unit)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path('scripts/build-adreno-metal-bridge.py'); s = p.read_text()
+          old = "'[profile.release]', 'panic = \"unwind\"', 'debug = 1',"
+          assert s.count(old) == 1, 'bridge release profile not found'
+          s = s.replace(old, "'[profile.release]', 'panic = \"unwind\"', 'debug = 1', 'lto = \"fat\"', 'codegen-units = 1',")
+          p.write_text(s); print('bridge profile: lto fat, codegen-units 1')
+          PY
+
       - name: Enable Turnip's on-disk shader cache
         run: |
           grep -q -- "-Dshader-cache=disabled" scripts/build-turnip-darwin.py
