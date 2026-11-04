@@ -31,8 +31,16 @@ on:
         description: Device repository ref
         required: true
         default: codex/ram-nc-posted-20261027
+      runner:
+        description: Hosted runner image. macos-26 (arm64) is the reference; macos-26-intel (x86_64, same Xcode 26.6) is the fallback when arm64 jobs are not acquired; macos-15 (arm64) has Xcode 26.3 at most (set xcode to 26.3) and shares the arm64 pool
+        type: choice
+        options:
+          - macos-26
+          - macos-26-intel
+          - macos-15
+        default: macos-26
       xcode:
-        description: Xcode version of the macos-26 image (/Applications/Xcode_<version>.app)
+        description: Xcode version of the runner image (/Applications/Xcode_<version>.app)
         required: true
         default: "26.6"
       skip_host_pressure:
@@ -62,10 +70,12 @@ defaults:
 
 jobs:
   gpu:
-    runs-on: macos-26
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 240
     env:
       DEVELOPER_DIR: /Applications/Xcode_${{ inputs.xcode }}.app/Contents/Developer
+      # Host build trees differ per image and architecture; the reference image keeps its existing cache keys.
+      CACHE_HOST: ${{ inputs.runner != 'macos-26' && format('{0}-', inputs.runner) || '' }}
     steps:
       - name: Check out UniXNU
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -230,10 +240,10 @@ jobs:
             build/mesa-tu
             build/mesa-tu-ios
             build/mesa-tu-ios.cross
-          key: mesa-build-${{ inputs.xcode }}-${{ steps.keys.outputs.mesa }}-${{ hashFiles('scripts/build-turnip-darwin.py', 'drivers/Adreno740/**/*.h') }}
+          key: mesa-build-${{ env.CACHE_HOST }}${{ inputs.xcode }}-${{ steps.keys.outputs.mesa }}-${{ hashFiles('scripts/build-turnip-darwin.py', 'drivers/Adreno740/**/*.h') }}
           restore-keys: |
-            mesa-build-${{ inputs.xcode }}-${{ steps.keys.outputs.mesa }}-
-            mesa-build-${{ inputs.xcode }}-
+            mesa-build-${{ env.CACHE_HOST }}${{ inputs.xcode }}-${{ steps.keys.outputs.mesa }}-
+            mesa-build-${{ env.CACHE_HOST }}${{ inputs.xcode }}-
 
       - name: Restore cargo and the bridge target directory
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -242,10 +252,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             build/m2v-target
-          key: m2v-${{ inputs.xcode }}-${{ steps.keys.outputs.m2v }}-${{ hashFiles('drivers/AdrenoMetal/bridge/*.rs') }}
+          key: m2v-${{ env.CACHE_HOST }}${{ inputs.xcode }}-${{ steps.keys.outputs.m2v }}-${{ hashFiles('drivers/AdrenoMetal/bridge/*.rs') }}
           restore-keys: |
-            m2v-${{ inputs.xcode }}-${{ steps.keys.outputs.m2v }}-
-            m2v-${{ inputs.xcode }}-
+            m2v-${{ env.CACHE_HOST }}${{ inputs.xcode }}-${{ steps.keys.outputs.m2v }}-
+            m2v-${{ env.CACHE_HOST }}${{ inputs.xcode }}-
 
       - name: Prepare the pinned inputs
         env:
