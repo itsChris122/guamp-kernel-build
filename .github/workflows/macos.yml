@@ -228,27 +228,67 @@ jobs:
           rm -f "$RUNNER_TEMP/prelink-candidate.tar.enc"
           ls out/guamp/tree/build/native-prelink | sed 's/^/candidate: /'
 
-      # guamp 30/10: XNU objects of earlier runs through ccache (scripts/build-xnu-4k-baseline.sh of the device repository
-      # passes CC/CXX through ccache when it is installed). This repository is public: the cache holds objects built from
-      # Apple sources, so it is stored encrypted with ARTIFACT_KEY like every other output.
+      # guamp 06/11: XNU objects of earlier runs through ccache. scripts/build-xnu-4k-baseline.sh of the device repository
+      # (7a7fc9a and later) passes CC/CXX to XNU's make as `ccache <xcode clang>` when ccache is on PATH. XNU compiles every
+      # object with -MJ <file>.o.json (the compile records the archive builders read) and ccache refuses -MJ as "too hard",
+      # so until 05/11 every compile ran uncached (cache ~6 MB, 0 hits). The `ccache` on PATH is now a shim: it drops -MJ,
+      # writes the same record with a driver-only run of the same command and hands the rest to the real ccache.
+      # This repository is public: the cache holds objects built from Apple sources, so it is stored encrypted with
+      # ARTIFACT_KEY like every other output.
       - name: Restore the compiler cache (encrypted)
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/ci-cache/ccache.tar.enc
-          key: ccache-xnu-${{ github.run_id }}
-          restore-keys: ccache-xnu-
+          key: ccache-v2-${{ runner.os }}-${{ runner.arch }}-xcode${{ inputs.xcode }}-${{ inputs.defconfig }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-v2-${{ runner.os }}-${{ runner.arch }}-xcode${{ inputs.xcode }}-${{ inputs.defconfig }}-
+            ccache-v2-${{ runner.os }}-${{ runner.arch }}-xcode${{ inputs.xcode }}-
 
       - name: Unpack the compiler cache
         env:
           ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+          CCACHE_DIR: ${{ runner.temp }}/ccache
         run: |
-          mkdir -p "$RUNNER_TEMP/ccache"
+          mkdir -p "$CCACHE_DIR"
           if [ -f "$RUNNER_TEMP/ci-cache/ccache.tar.enc" ]; then
-            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:ARTIFACT_KEY -in "$RUNNER_TEMP/ci-cache/ccache.tar.enc"               | tar -x -C "$RUNNER_TEMP/ccache" || { echo "::warning::compiler cache unreadable, starting empty"; rm -rf "$RUNNER_TEMP/ccache"; mkdir -p "$RUNNER_TEMP/ccache"; }
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:ARTIFACT_KEY -in "$RUNNER_TEMP/ci-cache/ccache.tar.enc" \
+              | tar -x -C "$CCACHE_DIR" || { echo "::warning::compiler cache unreadable, starting empty"; rm -rf "$CCACHE_DIR"; mkdir -p "$CCACHE_DIR"; }
             rm -f "$RUNNER_TEMP/ci-cache/ccache.tar.enc"
           fi
-          date +%s > "$RUNNER_TEMP/ccache-start"
-          du -sh "$RUNNER_TEMP/ccache"
+          du -sh "$CCACHE_DIR"
+          # The shim (see above). bash 3.2 of macOS: no `set -u`, plain arrays only.
+          shim="$RUNNER_TEMP/ccache-shim"
+          mkdir -p "$shim"
+          real=$(command -v ccache)
+          sed -e "s|@REAL@|$real|" -e "s|@LOG@|$RUNNER_TEMP/ccache-shim.log|" > "$shim/ccache" <<'SH'
+          #!/bin/bash
+          real='@REAL@'
+          mj=
+          args=()
+          while [ $# -gt 0 ]; do
+            if [ "$1" = -MJ ] && [ $# -ge 2 ]; then mj=$2; shift 2; else args+=("$1"); shift; fi
+          done
+          [ -n "$mj" ] || exec "$real" "${args[@]}"
+          probe="$mj.probe.$$"
+          pat=', "-fdriver-only"'
+          rm -f "$probe"
+          # args[0] is the compiler: the driver-only run writes the record (the -M options never appear in it).
+          if "${args[@]}" -MJ "$probe" -fdriver-only >/dev/null 2>&1 && record=$(<"$probe") && [[ "$record" == *"$pat"* ]]; then
+            rm -f "$probe"
+            printf '%s\n' "${record/$pat/}" >> "$mj"
+            echo cached >> '@LOG@'
+            exec "$real" "${args[@]}"
+          fi
+          rm -f "$probe"
+          echo direct >> '@LOG@'
+          exec "$real" "${args[@]}" -MJ "$mj"
+          SH
+          chmod +x "$shim/ccache"
+          : > "$RUNNER_TEMP/ccache-shim.log"
+          head -n 2 "$shim/ccache"
+          echo "== ccache before the build"
+          ccache -z >/dev/null
+          ccache -s
 
       - name: Build kernel
         id: kernel
@@ -256,15 +296,18 @@ jobs:
           CCACHE_DIR: ${{ runner.temp }}/ccache
           CCACHE_BASEDIR: ${{ github.workspace }}
           CCACHE_NOHASHDIR: "true"
-          CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers
-          CCACHE_MAXSIZE: 3G
+          # Every run makes a new tree: hash the contents, not mtime/ctime. Depend mode: a miss compiles once and reads the
+          # -MD output instead of running the preprocessor as well.
+          CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,pch_defines,modules,locale,clang_index_store
+          CCACHE_DEPEND: "true"
+          CCACHE_COMPILERCHECK: content
+          CCACHE_MAXSIZE: 2G
           # prepare-xnu-source.py lists Apple sources through the GitHub API; anonymous calls from hosted runners hit
           # the shared rate limit (HTTP 403).
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          ccache -z >/dev/null 2>&1 || true
+          export PATH="$RUNNER_TEMP/ccache-shim:$PATH"
           ./unixnu build kernel
-          ccache -s 2>/dev/null | head -14 || true
 
       - name: Pack the compiler cache
         id: ccachepack
@@ -272,13 +315,24 @@ jobs:
         env:
           ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
           CCACHE_DIR: ${{ runner.temp }}/ccache
+          CCACHE_MAXSIZE: 2G
         run: |
-          # only what this build used, so the snapshot stays the size of one build
-          age=$(( $(date +%s) - $(cat "$RUNNER_TEMP/ccache-start") + 60 ))
-          ccache --evict-older-than "${age}s" >/dev/null 2>&1 || true
+          echo "== ccache after the build (kernel step: ${{ steps.kernel.outcome }})"
+          ccache -s -v || true
+          echo "== XNU compiles through the shim: $(grep -c '^cached$' "$RUNNER_TEMP/ccache-shim.log" || true) cached, $(grep -c '^direct$' "$RUNNER_TEMP/ccache-shim.log" || true) direct"
+          # Saved on failure too (hits survive a broken patch). Entries no run used for 3 days go; ccache refreshes an
+          # entry's mtime on every hit, and the size limit bounds the rest.
+          ccache --evict-older-than 3d >/dev/null 2>&1 || true
+          ccache -c >/dev/null 2>&1 || true
           mkdir -p "$RUNNER_TEMP/ci-cache"
-          tar -c -C "$CCACHE_DIR" . | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:ARTIFACT_KEY -out "$RUNNER_TEMP/ci-cache/ccache.tar.enc"
+          tar -c -C "$CCACHE_DIR" --exclude ./tmp . | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:ARTIFACT_KEY -out "$RUNNER_TEMP/ci-cache/ccache.tar.enc"
           ls -l "$RUNNER_TEMP/ci-cache"
+          {
+            echo "### ccache"
+            echo '```'
+            ccache -s | head -n 12
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY" || true
           echo "ccache=true" >> "$GITHUB_OUTPUT"
 
       - name: Save the compiler cache
@@ -286,7 +340,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/ci-cache/ccache.tar.enc
-          key: ccache-xnu-${{ github.run_id }}
+          key: ccache-v2-${{ runner.os }}-${{ runner.arch }}-xcode${{ inputs.xcode }}-${{ inputs.defconfig }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # Archive builders that check original kexts (the legacy display, PMGR audits) read a prelink candidate of an earlier
       # build of the same kernelcache from build/native-prelink. Keep this build's kernel and plan there, in the cached tree.
