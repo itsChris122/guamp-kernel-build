@@ -302,6 +302,8 @@ jobs:
           CCACHE_DEPEND: "true"
           CCACHE_COMPILERCHECK: content
           CCACHE_MAXSIZE: 2G
+          # Timing of each call, summarised in the pack step (the file stays on the runner).
+          CCACHE_LOGFILE: ${{ runner.temp }}/ccache-calls.log
           # prepare-xnu-source.py lists Apple sources through the GitHub API; anonymous calls from hosted runners hit
           # the shared rate limit (HTTP 403).
           GITHUB_TOKEN: ${{ github.token }}
@@ -319,6 +321,40 @@ jobs:
         run: |
           echo "== ccache after the build (kernel step: ${{ steps.kernel.outcome }})"
           ccache -s -v || true
+          if [ -f "$RUNNER_TEMP/ccache-calls.log" ]; then
+            python3 - "$RUNNER_TEMP/ccache-calls.log" <<'PY' || true
+          import re, sys, collections
+          from datetime import datetime
+          line = re.compile(r'^\[(\S+) (\d+)\s*\] (.*)$')
+          calls = collections.defaultdict(dict)
+          for raw in open(sys.argv[1], errors='replace'):
+              m = line.match(raw)
+              if not m:
+                  continue
+              t = datetime.fromisoformat(m.group(1)).timestamp()
+              c = calls[m.group(2)]
+              c.setdefault('first', t)
+              c['last'] = t
+              msg = m.group(3)
+              if msg.startswith('Executing ') and 'exec' not in c:
+                  c['exec'] = t
+              elif 'exec' in c and 'after' not in c and not msg.startswith('Executing '):
+                  c['after'] = t
+              if msg.startswith('Result: '):
+                  c.setdefault('result', msg[8:].split()[0])
+          tot = collections.Counter(); n = collections.Counter()
+          for c in calls.values():
+              r = c.get('result', '?'); n[r] += 1
+              tot[r, 'all'] += c['last'] - c['first']
+              if 'exec' in c:
+                  tot[r, 'before'] += c['exec'] - c['first']
+                  tot[r, 'compiler'] += c.get('after', c['last']) - c['exec']
+                  tot[r, 'after'] += c['last'] - c.get('after', c['last'])
+          print('== ccache time per result (summed seconds over all calls)')
+          for r in sorted(n):
+              print(f"{r:28} calls {n[r]:5}  all {tot[r,'all']:8.1f}  before-compiler {tot[r,'before']:8.1f}  compiler {tot[r,'compiler']:8.1f}  after {tot[r,'after']:8.1f}")
+          PY
+          fi
           echo "== XNU compiles through the shim: $(grep -c '^cached$' "$RUNNER_TEMP/ccache-shim.log" || true) cached, $(grep -c '^direct$' "$RUNNER_TEMP/ccache-shim.log" || true) direct"
           # Saved on failure too (hits survive a broken patch). Entries no run used for 3 days go; ccache refreshes an
           # entry's mtime on every hit, and the size limit bounds the rest.
