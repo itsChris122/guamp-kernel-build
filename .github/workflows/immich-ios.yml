@@ -1,0 +1,230 @@
+name: Immich iOS app from source (unsigned release, encrypted output)
+
+# Builds the Immich mobile app (github.com/immich-app/immich, mobile/, Flutter, AGPL-3.0) for iOS in release mode without any
+# Apple signing, from the upstream source at a pinned tag. Nothing is downloaded from the App Store or third-party IPA sites.
+# The device it is for is an ARMv8.0 CPU (no LSE atomics): the job scans every Mach-O of the bundle for ARMv8.1+ atomic
+# instructions and prints only the counts. The .app leaves the runner only encrypted with ARTIFACT_KEY, like the other
+# workflows of this repository; signing (ad-hoc, owner trust cache) happens on the owner's PC.
+
+on:
+  push:
+    branches: [codex/immich-20261106]
+    paths: [.github/workflows/immich-ios.yml]
+  workflow_dispatch:
+    inputs:
+      immich_ref:
+        description: Immich tag or commit (mobile/ of github.com/immich-app/immich)
+        required: true
+        default: v3.3.6
+      flutter_version:
+        description: Flutter SDK tag (mobile/mise.toml of that Immich ref; empty = read it from there)
+        required: false
+        default: ""
+      xcode:
+        description: Xcode version (/Applications/Xcode_<version>.app), or "latest"
+        required: true
+        default: latest
+
+permissions:
+  contents: read
+
+concurrency:
+  group: immich-ios-${{ github.ref }}-${{ inputs.immich_ref || 'v3.3.6' }}
+  cancel-in-progress: false
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  HOMEBREW_NO_ENV_HINTS: 1
+  IMMICH_REF: ${{ inputs.immich_ref || 'v3.3.6' }}
+  FLUTTER_VERSION_INPUT: ${{ inputs.flutter_version || '' }}
+  XCODE_INPUT: ${{ inputs.xcode || 'latest' }}
+  COCOAPODS_DISABLE_STATS: "true"
+  CI: "true"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ios:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - name: Check out Immich
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: immich-app/immich
+          ref: ${{ env.IMMICH_REF }}
+          path: immich
+          persist-credentials: false
+
+      - name: Select Xcode
+        run: |
+          if [ "$XCODE_INPUT" = latest ]; then
+            app=$(ls -d /Applications/Xcode_[0-9]*.app | grep -vi beta | sort -V | tail -1)
+          else
+            app=/Applications/Xcode_$XCODE_INPUT.app
+          fi
+          [ -d "$app" ] || { echo "::error::Xcode not found: $app; installed: $(ls -d /Applications/Xcode_*.app | tr '\n' ' ')"; exit 1; }
+          echo "DEVELOPER_DIR=$app/Contents/Developer" >> "$GITHUB_ENV"
+          DEVELOPER_DIR=$app/Contents/Developer xcodebuild -version
+          DEVELOPER_DIR=$app/Contents/Developer xcrun --sdk iphoneos --show-sdk-version
+
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: zulu
+          java-version: "21"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: Install Flutter
+        run: |
+          version=$FLUTTER_VERSION_INPUT
+          if [ -z "$version" ]; then
+            # mobile/mise.toml: [tools."aqua:flutter/flutter"] version = "x.y.z"
+            version=$(awk '/aqua:flutter\/flutter/{f=1;next} f&&/^version/{gsub(/[" ]/,"");sub("version=","");print;exit}' immich/mobile/mise.toml)
+          fi
+          [ -n "$version" ] || { echo "::error::Flutter version not found"; exit 1; }
+          echo "Flutter $version"
+          git clone -q --depth 1 --branch "$version" https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/flutter/bin:$PATH"
+          flutter config --no-analytics >/dev/null
+          flutter --version
+          flutter precache --ios
+          pod --version || brew install cocoapods
+
+      - name: Generate the Dart OpenAPI client
+        working-directory: immich/open-api
+        run: |
+          version=$(awk -F'"' '/openapi-generator-cli/{print $4; exit}' ../mise.toml)
+          npm install -g "@openapitools/openapi-generator-cli@${version:-2.41.0}"
+          bash ./bin/generate-dart-sdk.sh
+          test -f ../mobile/generated/openapi/pubspec.yaml
+
+      - name: Dependencies and codegen
+        working-directory: immich/mobile
+        run: |
+          # The steps of mobile/mise.toml (install:ci + codegen) without the formatting tasks.
+          flutter pub get --enforce-lockfile
+          dart run easy_localization:generate -S ../i18n
+          dart run bin/generate_keys.dart
+          for f in pigeon/*.dart; do dart run pigeon --input "$f"; done
+          dart run drift_dev make-migrations
+          dart run build_runner build --delete-conflicting-outputs
+          (cd ios && pod install)
+
+      - name: Build the iOS app (release, no code signing)
+        working-directory: immich/mobile
+        run: |
+          set -o pipefail
+          flutter build ios --release --no-codesign 2>&1 | tee "$RUNNER_TEMP/flutter-build.log"
+          ls -la build/ios/iphoneos/
+
+      - name: Scan the bundle for ARMv8.1+ atomics
+        id: scan
+        run: |
+          app=immich/mobile/build/ios/iphoneos/Runner.app
+          python3 - "$app" > "$RUNNER_TEMP/lse-report.txt" <<'PY'
+          import os, struct, sys
+          # Counts, in the executable sections of every arm64 Mach-O slice, the ARMv8.1 LSE atomics
+          # (LDADD/LDCLR/LDEOR/LDSET/LD[SU]MAX/LD[SU]MIN/SWP, also LDAPR) and CAS*. The target CPU (Kryo 260) is ARMv8.0.
+          def slices(data):
+              magic = struct.unpack_from('>I', data)[0]
+              if magic in (0xcafebabe, 0xcafebabf):
+                  n = struct.unpack_from('>I', data, 4)[0]
+                  for i in range(n):
+                      if magic == 0xcafebabe:
+                          cpu, sub, off, size, _ = struct.unpack_from('>iiIII', data, 8 + 20 * i)
+                      else:
+                          cpu, sub, off, size, _, _ = struct.unpack_from('>iiQQII', data, 8 + 32 * i)
+                      yield cpu, sub, data[off:off + size]
+              elif struct.unpack_from('<I', data)[0] == 0xfeedfacf:
+                  cpu, sub = struct.unpack_from('<ii', data, 4)
+                  yield cpu, sub, data
+          def count(m):
+              ncmds = struct.unpack_from('<I', m, 16)[0]
+              off, lse, cas, words = 32, 0, 0, 0
+              for _ in range(ncmds):
+                  cmd, size = struct.unpack_from('<II', m, off)
+                  if cmd == 0x19:
+                      nsects = struct.unpack_from('<I', m, off + 64)[0]
+                      for i in range(nsects):
+                          s = off + 72 + i * 80
+                          flags = struct.unpack_from('<I', m, s + 64)[0]
+                          if flags & 0x80000400:
+                              size_, foff = struct.unpack_from('<QI', m, s + 40)
+                              for (w,) in struct.iter_unpack('<I', m[foff:foff + size_ - size_ % 4]):
+                                  words += 1
+                                  if (w & 0x3F200C00) == 0x38200000:
+                                      lse += 1
+                                  elif (w & 0x3FA07C00) == 0x08A07C00:
+                                      cas += 1
+                  off += size
+              return words, lse, cas
+          root = sys.argv[1]
+          total = 0
+          for d, _, files in os.walk(root):
+              for f in sorted(files):
+                  p = os.path.join(d, f)
+                  if os.path.islink(p):
+                      continue
+                  with open(p, 'rb') as fh:
+                      head = fh.read(4)
+                      if head not in (b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf', b'\xcf\xfa\xed\xfe'):
+                          continue
+                      data = head + fh.read()
+                  for cpu, sub, m in slices(data):
+                      if cpu != 0x0100000c:
+                          print(f'{os.path.relpath(p, root)}: cpu {cpu:#x} (not arm64) skipped')
+                          continue
+                      words, lse, cas = count(m)
+                      total += lse + cas
+                      print(f'{os.path.relpath(p, root)}: arm64 sub {sub & 0xff:#x} words {words} LSE {lse} CAS {cas}')
+          print(f'TOTAL LSE+CAS {total}')
+          PY
+          cat "$RUNNER_TEMP/lse-report.txt"
+          echo "total=$(awk '/^TOTAL/{print $3}' "$RUNNER_TEMP/lse-report.txt")" >> "$GITHUB_OUTPUT"
+
+      - name: Encrypt the output
+        id: seal
+        env:
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+        run: |
+          out="$RUNNER_TEMP/immich-ios"
+          mkdir -p "$out"
+          ditto immich/mobile/build/ios/iphoneos/Runner.app "$out/Runner.app"
+          cp "$RUNNER_TEMP/lse-report.txt" "$out/"
+          {
+            echo "immich_ref=$IMMICH_REF"
+            echo "immich_commit=$(git -C immich rev-parse HEAD)"
+            echo "flutter=$(flutter --version --machine | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["frameworkVersion"], d["engineRevision"])')"
+            echo "xcode=$(xcodebuild -version | tr '\n' ' ')"
+            echo "sdk=$(xcrun --sdk iphoneos --show-sdk-version)"
+          } > "$out/build-info.txt"
+          cat "$out/build-info.txt"
+          du -sh "$out/Runner.app"
+          tar -c -C "$RUNNER_TEMP" immich-ios | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:ARTIFACT_KEY -out "$RUNNER_TEMP/immich-ios.tar.enc"
+          ls -l "$RUNNER_TEMP/immich-ios.tar.enc"
+
+      - name: Upload the encrypted output
+        if: steps.seal.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: immich-ios-enc
+          path: ${{ runner.temp }}/immich-ios.tar.enc
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Immich iOS ($IMMICH_REF)"
+            echo
+            echo "ARMv8.1 atomics in the bundle (LSE+CAS): **${{ steps.scan.outputs.total || 'n/a' }}**"
+            echo
+            [ -f "$RUNNER_TEMP/lse-report.txt" ] && { echo '```'; cat "$RUNNER_TEMP/lse-report.txt"; echo '```'; }
+          } >> "$GITHUB_STEP_SUMMARY"
