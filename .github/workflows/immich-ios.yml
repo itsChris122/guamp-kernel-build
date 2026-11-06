@@ -123,12 +123,14 @@ jobs:
           set -o pipefail
           flutter build ios --release --no-codesign 2>&1 | tee "$RUNNER_TEMP/flutter-build.log"
           ls -la build/ios/iphoneos/
+          apps=(build/ios/iphoneos/*.app)
+          [ ${#apps[@]} = 1 ] && [ -d "${apps[0]}" ] || { echo "::error::expected one .app in build/ios/iphoneos"; exit 1; }
+          echo "APP=$PWD/${apps[0]}" >> "$GITHUB_ENV"
 
       - name: Scan the bundle for ARMv8.1+ atomics
         id: scan
         run: |
-          app=immich/mobile/build/ios/iphoneos/Runner.app
-          python3 - "$app" > "$RUNNER_TEMP/lse-report.txt" <<'PY'
+          python3 - "$APP" > "$RUNNER_TEMP/lse-report.txt" <<'PY'
           import os, struct, sys
           # Counts, in the executable sections of every arm64 Mach-O slice, the ARMv8.1 LSE atomics
           # (LDADD/LDCLR/LDEOR/LDSET/LD[SU]MAX/LD[SU]MIN/SWP, also LDAPR) and CAS*. The target CPU (Kryo 260) is ARMv8.0.
@@ -166,7 +168,7 @@ jobs:
                   off += size
               return words, lse, cas
           root = sys.argv[1]
-          total = 0
+          total = machos = 0
           for d, _, files in os.walk(root):
               for f in sorted(files):
                   p = os.path.join(d, f)
@@ -182,8 +184,12 @@ jobs:
                           print(f'{os.path.relpath(p, root)}: cpu {cpu:#x} (not arm64) skipped')
                           continue
                       words, lse, cas = count(m)
+                      machos += 1
                       total += lse + cas
                       print(f'{os.path.relpath(p, root)}: arm64 sub {sub & 0xff:#x} words {words} LSE {lse} CAS {cas}')
+          if not machos:
+              sys.exit('no arm64 Mach-O found in ' + root)
+          print(f'arm64 Mach-O files: {machos}')
           print(f'TOTAL LSE+CAS {total}')
           PY
           cat "$RUNNER_TEMP/lse-report.txt"
@@ -196,7 +202,7 @@ jobs:
         run: |
           out="$RUNNER_TEMP/immich-ios"
           mkdir -p "$out"
-          ditto immich/mobile/build/ios/iphoneos/Runner.app "$out/Runner.app"
+          ditto "$APP" "$out/Immich.app"
           cp "$RUNNER_TEMP/lse-report.txt" "$out/"
           {
             echo "immich_ref=$IMMICH_REF"
@@ -206,7 +212,7 @@ jobs:
             echo "sdk=$(xcrun --sdk iphoneos --show-sdk-version)"
           } > "$out/build-info.txt"
           cat "$out/build-info.txt"
-          du -sh "$out/Runner.app"
+          du -sh "$out/Immich.app"
           tar -c -C "$RUNNER_TEMP" immich-ios | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:ARTIFACT_KEY -out "$RUNNER_TEMP/immich-ios.tar.enc"
           ls -l "$RUNNER_TEMP/immich-ios.tar.enc"
 
