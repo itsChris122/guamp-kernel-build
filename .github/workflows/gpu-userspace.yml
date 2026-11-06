@@ -288,10 +288,18 @@ jobs:
       - name: Check the device Mesa/Turnip patches
         run: |
           if ! compgen -G "device/patches/mesa-turnip/*.patch" > /dev/null; then echo "no device mesa-turnip patches"; exit 0; fi
-          for p in device/patches/mesa-turnip/*.patch; do
-            git -C .cache/mesa-work apply --reverse --check "$PWD/$p" || { echo "::error::Mesa device patch $(basename "$p") is not in the source"; exit 1; }
+          # Later patches may change the lines of earlier ones (0004 over 0003), so each patch is reversed for real, newest first,
+          # on a scratch copy of the touched files only (the Mesa tree and its mtimes stay as they are).
+          scratch=$(mktemp -d)
+          for p in device/patches/mesa-turnip/*.patch; do git apply --numstat "$PWD/$p" | cut -f3; done | sort -u | while read -r f; do
+            if [ -e ".cache/mesa-work/$f" ]; then mkdir -p "$scratch/$(dirname "$f")"; cp ".cache/mesa-work/$f" "$scratch/$f"; fi
+          done
+          top=$PWD
+          for p in $(ls device/patches/mesa-turnip/*.patch | sort -r); do
+            (cd "$scratch" && git apply --reverse "$top/$p") || { echo "::error::Mesa device patch $(basename "$p") is not in the source"; exit 1; }
             echo "mesa-turnip patch: $(basename "$p") $(shasum -a 256 "$p" | cut -c1-16)"
           done
+          rm -rf "$scratch"
 
       - name: Build the host Turnip (replay recording)
         if: inputs.host_replay
