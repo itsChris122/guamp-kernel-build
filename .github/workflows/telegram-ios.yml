@@ -180,6 +180,10 @@ jobs:
         run: |
           cd "$TG_SRC"
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          # The upstream fake profiles expired on 2026-10-30 (rules_apple refuses expired profiles): re-issue them with the
+          # same self-signed key, only ExpirationDate changes.
+          which openssl; openssl version
+          python3 "$GITHUB_WORKSPACE/guamp/scripts/telegram/refresh-fake-profiles.py" build-system/fake-codesigning
 
       - name: Build (release_arm64)
         run: |
