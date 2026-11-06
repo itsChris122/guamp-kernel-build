@@ -1,0 +1,299 @@
+name: Telegram iOS from source (ARMv8.0, fake-signed, encrypted output)
+
+# Builds Telegram for iOS (github.com/TelegramMessenger/Telegram-iOS, GPLv2) from the official source at a pinned commit, with
+# the repository's own recipe (build-system/Make/Make.py + Bazel, fake codesigning in build-system/fake-codesigning, the same
+# path as upstream .github/workflows/build.yml). Nothing comes from the App Store or third-party IPA sites.
+# The device is an ARMv8.0 CPU (Kryo 260: no LSE atomics, no PAuth): arm64 only (no arm64e), C/ObjC pinned to apple-a7
+# (ARMv8.0), share/notification/widget/intents/broadcast extensions and the watch app disabled; every Mach-O of the bundle is
+# scanned and the job fails if any ARMv8.1+ instruction is found.
+# The API credentials are the owner's personal ones from my.telegram.org, read from the secrets TELEGRAM_API_ID and
+# TELEGRAM_API_HASH (never printed). credentials=placeholder builds with dummy values only to test the toolchain and the scan:
+# that app cannot log in. The .app leaves the runner only encrypted with ARTIFACT_KEY; the real signing (ldid ad hoc,
+# owner trust cache) happens on the owner's PC.
+
+on:
+  push:
+    branches: [codex/telegram-20261106]
+    paths: [.github/workflows/telegram-ios.yml, scripts/telegram/**]
+  workflow_dispatch:
+    inputs:
+      telegram_ref:
+        description: Telegram-iOS commit (TelegramMessenger/Telegram-iOS)
+        required: true
+        default: 279f89e4d4f63f17227bf877dc3d8990f22ecd58
+      credentials:
+        description: secrets = TELEGRAM_API_ID/TELEGRAM_API_HASH (owner's own); placeholder = dummy values, compile/scan test only
+        type: choice
+        options: [secrets, placeholder]
+        default: secrets
+      build_number:
+        description: CFBundleVersion
+        required: true
+        default: "30001"
+      runner:
+        description: Hosted runner image (versions.json of the pinned commit wants Xcode 27.1 / macOS 27 = xcode-27)
+        type: choice
+        options: [xcode-27, macos-26]
+        default: xcode-27
+      xcode:
+        description: Xcode version (/Applications/Xcode_<version>.app)
+        required: true
+        default: "27.1"
+      pin_cpu:
+        description: Add --copt=-mcpu=apple-a7 (ARMv8.0) for C/C++/ObjC (Swift and Rust already default to apple-a7 for arm64-apple-ios)
+        type: boolean
+        default: true
+      fail_on_armv81:
+        description: Fail the job when the scan finds ARMv8.1+ instructions (the encrypted output is still uploaded)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-ios-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  HOMEBREW_NO_ENV_HINTS: 1
+  TG_SRC: /Users/Shared/telegram-ios
+  BAZEL_USER_ROOT: /private/var/tmp/_bazel_containerhost
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  preflight:
+    # A push only checks that the owner's secrets exist (no build): the build is started with workflow_dispatch.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the secrets
+        env:
+          TG_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TG_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          KEY: ${{ secrets.ARTIFACT_KEY }}
+        run: |
+          [ -n "$KEY" ] && echo "ARTIFACT_KEY: set" || echo "::error::ARTIFACT_KEY missing"
+          if [[ "$TG_ID" =~ ^[0-9]+$ ]]; then echo "TELEGRAM_API_ID: set"; else echo "::warning::TELEGRAM_API_ID missing or not numeric (gh secret set TELEGRAM_API_ID)"; fi
+          if [[ "$TG_HASH" =~ ^[0-9a-f]{32}$ ]]; then echo "TELEGRAM_API_HASH: set"; else echo "::warning::TELEGRAM_API_HASH missing or not 32 hex digits (gh secret set TELEGRAM_API_HASH)"; fi
+
+  telegram:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360
+    steps:
+      - name: Check out the scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: guamp
+          persist-credentials: false
+
+      - name: Check the credentials
+        env:
+          TG_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TG_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          KEY: ${{ secrets.ARTIFACT_KEY }}
+          MODE: ${{ inputs.credentials }}
+        run: |
+          [ -n "$KEY" ] || { echo "::error::ARTIFACT_KEY missing"; exit 1; }
+          if [ "$MODE" = secrets ]; then
+            [[ "$TG_ID" =~ ^[0-9]+$ ]] || { echo "::error::secret TELEGRAM_API_ID missing or not numeric: the owner sets it with gh secret set TELEGRAM_API_ID (value from my.telegram.org)"; exit 1; }
+            [[ "$TG_HASH" =~ ^[0-9a-f]{32}$ ]] || { echo "::error::secret TELEGRAM_API_HASH missing or not 32 hex digits: gh secret set TELEGRAM_API_HASH"; exit 1; }
+            echo "owner credentials present"
+          else
+            echo "::warning::placeholder credentials: compile and scan test only, the app cannot log in"
+          fi
+
+      - name: Select Xcode
+        run: |
+          app=/Applications/Xcode_${{ inputs.xcode }}.app
+          [ -d "$app" ] || { echo "::error::Xcode not found: $app; installed: $(ls -d /Applications/Xcode_*.app | tr '\n' ' ')"; exit 1; }
+          sudo xcode-select -s "$app/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          sw_vers; sysctl -n hw.ncpu hw.memsize
+
+      - name: Free disk space
+        run: |
+          df -h / | tail -1
+          keep=/Applications/Xcode_${{ inputs.xcode }}.app
+          for x in /Applications/Xcode_*.app; do
+            [ "$(cd "$x" && pwd -P)" = "$(cd "$keep" && pwd -P)" ] || [ -L "$x" ] || sudo rm -rf "$x" &
+          done
+          sudo rm -rf "${ANDROID_HOME:-/nonexistent}" ~/Library/Android /usr/local/share/dotnet ~/.dotnet /Users/runner/hostedtoolcache/CodeQL &
+          wait
+          xcrun simctl runtime delete all >/dev/null 2>&1 || true
+          df -h / | tail -1
+
+      - name: Fetch Telegram-iOS (pinned commit, recursive submodules)
+        run: |
+          set -x
+          sudo mkdir -p "$TG_SRC"; sudo chown "$(id -u):$(id -g)" "$TG_SRC"
+          cd "$TG_SRC"
+          git init -q .
+          git remote add origin https://github.com/TelegramMessenger/Telegram-iOS.git
+          git fetch -q --depth 1 origin "${{ inputs.telegram_ref }}"
+          git checkout -q FETCH_HEAD
+          git submodule sync --recursive
+          git submodule update --init --recursive --depth 1 --jobs 8 || git submodule update --init --recursive --jobs 8
+          git log -1 --format='%H %cd'
+          git submodule status --recursive | head -40
+          cat versions.json
+          du -sh . ; df -h / | tail -1
+
+      - name: Configuration and Bazel options
+        env:
+          TG_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TG_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          MODE: ${{ inputs.credentials }}
+          PIN: ${{ inputs.pin_cpu }}
+        run: |
+          cd "$TG_SRC"
+          if [ "$MODE" = secrets ]; then id="$TG_ID"; hash="$TG_HASH"; else id=1; hash=00000000000000000000000000000000; fi
+          # bundle_id and team_id must match build-system/fake-codesigning/profiles (upstream CI recipe); the real signature is
+          # replaced on the owner's PC. iCloud/Siri off; extensions and watch app off below.
+          python3 - "$RUNNER_TEMP/telegram-configuration.json" "$id" "$hash" <<'PY'
+          import json, sys
+          path, api_id, api_hash = sys.argv[1:4]
+          json.dump({
+              "bundle_id": "ph.telegra.Telegraph", "api_id": api_id, "api_hash": api_hash, "team_id": "C67CF9S4VU",
+              "app_center_id": "0", "is_internal_build": "false", "is_appstore_build": "false", "appstore_id": "0",
+              "app_specific_url_scheme": "tg", "premium_iap_product_id": "", "enable_siri": False, "enable_icloud": False,
+          }, open(path, "w"), indent=1)
+          PY
+          {
+            echo
+            echo '# guamp (Moto G9 Play, ARMv8.0): no app extensions, no watch app'
+            echo 'build --//Telegram:disableExtensions'
+            if [ "$PIN" = true ]; then
+              echo 'build --copt=-mcpu=apple-a7'
+            fi
+          } >> .bazelrc
+          tail -5 .bazelrc
+
+      - name: Import the fake signing certificate
+        run: |
+          cd "$TG_SRC"
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+
+      - name: Build (release_arm64)
+        run: |
+          cd "$TG_SRC"
+          mkdir -p "$RUNNER_TEMP/tg-logs"
+          set +e +o pipefail
+          python3 -u build-system/Make/Make.py \
+            --overrideXcodeVersion \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --cacheDir="$RUNNER_TEMP/bazel-disk-cache" \
+            build \
+            --configurationPath="$RUNNER_TEMP/telegram-configuration.json" \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="${{ inputs.build_number }}" \
+            --outputBuildArtifactsPath="$RUNNER_TEMP/tg-artifacts" 2>&1 | tee "$RUNNER_TEMP/tg-logs/build.log" | grep --line-buffered -vE '^INFO: From |^\s*$'
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" = 0 ] || { echo "::error::Make.py build failed ($rc)"; grep -E 'ERROR|error:' "$RUNNER_TEMP/tg-logs/build.log" | head -60; exit 1; }
+          ls -l "$RUNNER_TEMP/tg-artifacts"
+          df -h / | tail -1
+
+      - name: Unpack and scan for ARMv8.1+ instructions
+        id: scan
+        run: |
+          out="$RUNNER_TEMP/telegram-ios"
+          mkdir -p "$out"
+          ditto -x -k "$RUNNER_TEMP/tg-artifacts/Telegram.ipa" "$out/ipa"
+          app="$out/ipa/Payload/Telegram.app"
+          [ -d "$app" ] || { echo "::error::Payload/Telegram.app not found"; ls -R "$out/ipa" | head; exit 1; }
+          set +e
+          python3 guamp/scripts/telegram/scan-armv8.py "$app" --json "$out/scan-armv8.json" > "$out/scan-armv8.txt"
+          rc=$?
+          set -e
+          grep -E 'TOTAL|LSE [1-9]|CAS [1-9]|CASP [1-9]|PAC [1-9]|not arm64' "$out/scan-armv8.txt" || true
+          echo "total=$(awk '/^TOTAL/{print $3}' "$out/scan-armv8.txt")" >> "$GITHUB_OUTPUT"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # entitlements requested by the build (the PC script keeps only an allow-list), sizes, provenance
+          codesign -d --entitlements - --xml "$app" > "$out/entitlements-built.plist" 2>/dev/null || true
+          find "$app" -type f -print0 | xargs -0 file | grep -c 'Mach-O' | sed 's/^/Mach-O files: /'
+          du -sh "$app"
+          python3 - "$app" > "$out/sizes.txt" <<'PY'
+          import os, sys, zlib
+          root = sys.argv[1]; raw = packed = files = 0
+          for d, _, names in os.walk(root):
+              for n in names:
+                  p = os.path.join(d, n)
+                  if os.path.islink(p): continue
+                  b = open(p, 'rb').read(); raw += len(b); packed += len(zlib.compress(b, 9)); files += 1
+          print(f'files {files} bytes {raw} zlib9 {packed}')
+          PY
+          cat "$out/sizes.txt"
+          {
+            echo "telegram_ref ${{ inputs.telegram_ref }} ($(git -C "$TG_SRC" rev-parse HEAD))"
+            echo "credentials ${{ inputs.credentials }} pin_cpu ${{ inputs.pin_cpu }} build_number ${{ inputs.build_number }}"
+            echo "runner ${{ inputs.runner }} $(sw_vers -productVersion)"
+            xcodebuild -version | tr '\n' ' '; echo
+            ls "$TG_SRC/build-input" | grep bazel || true
+            git -C "$TG_SRC" submodule status --recursive
+          } > "$out/provenance.txt"
+          mv "$out/ipa/Payload/Telegram.app" "$out/Telegram.app"
+          rm -rf "$out/ipa"
+
+      - name: Encrypt the output
+        id: seal
+        env:
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+        run: |
+          tar -c -C "$RUNNER_TEMP" telegram-ios | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:ARTIFACT_KEY -out "$RUNNER_TEMP/telegram-ios.tar.enc"
+          ls -l "$RUNNER_TEMP/telegram-ios.tar.enc"
+
+      - name: Upload the encrypted output
+        if: steps.seal.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: telegram-ios-enc
+          path: ${{ runner.temp }}/telegram-ios.tar.enc
+          retention-days: 7
+          compression-level: 0
+
+      - name: Fail on ARMv8.1+ instructions
+        if: inputs.fail_on_armv81 && steps.scan.outputs.rc != '0'
+        run: |
+          echo "::error::the bundle contains ${{ steps.scan.outputs.total }} ARMv8.1+ instructions (see scan-armv8.txt in the encrypted output)"
+          exit 1
+
+      - name: Encrypt the build logs on failure
+        if: failure()
+        env:
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/tg-logs"
+          cp "$RUNNER_TEMP/telegram-ios/scan-armv8.txt" "$RUNNER_TEMP/tg-logs/" 2>/dev/null || true
+          df -h / > "$RUNNER_TEMP/tg-logs/df.txt" 2>&1 || true
+          tar -c -C "$RUNNER_TEMP" tg-logs | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:ARTIFACT_KEY -out "$RUNNER_TEMP/tg-logs.tar.enc"
+
+      - name: Upload the encrypted logs on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: telegram-ios-logs-enc
+          path: ${{ runner.temp }}/tg-logs.tar.enc
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Telegram iOS from source"
+            echo
+            echo "Telegram-iOS \`${{ inputs.telegram_ref }}\`, credentials **${{ inputs.credentials }}**, runner ${{ inputs.runner }}, Xcode ${{ inputs.xcode }}"
+            echo
+            echo "ARMv8.1+ instructions in the bundle (LSE+CAS+CASP+PAC): **${{ steps.scan.outputs.total || 'n/a' }}**"
+            echo
+            echo "Artifact \`telegram-ios-enc\` (7 days): Telegram.app (fake-signed), scan, built entitlements, sizes, provenance."
+            echo "Sign on the owner's PC: strumenti/firma-telegram.sh (ldid ad hoc + owner trust cache)."
+          } >> "$GITHUB_STEP_SUMMARY"
